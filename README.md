@@ -1,1 +1,5 @@
 # TimeSeriesEmbedding
+
+$$
+\vec{a}
+$$

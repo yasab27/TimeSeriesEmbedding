@@ -185,7 +185,7 @@ class CausalConvolutionBlock(torch.nn.Module):
             Whether or not to perform one final activation function on the channels before passing them to the
             next step of the network. By default this is set to false. 
         """
-        
+
         super(CausalConvolutionBlock,self).__init__()
 
         # Begin by first computing the padding size for the 1D convolution and later causal truncation
@@ -268,8 +268,226 @@ class CausalConvolutionBlock(torch.nn.Module):
         Returns
         -------
         feature_maps: tensor
-            A rank 3 tensor containing the output of the convolutional block.
+            A rank 3 tensor containing the output of the convolutional block of dimension (B,C_out,L).
         """
+
+        # First perform the forward propogation from the main block
+        main_output = self.causal(input=X)
+
+        # If the input and output channels do not match perform convolution on the residual skip
+        # connection. Otherwise simply pass it forward. 
+        if self.resid_up_down_sample is not None:
+            resid = self.resid_up_down_sample(X)
+        else:
+            resid = X
+        
+        # Now combine the outputs and residual connetion through a simple sum
+        feature_maps = resid+main_output
+
+        # If a final activation is requested, pass this through one last RElU, otherwise return. 
+        if self.use_final_activation:
+            return torch.nn.ReLU(feature_maps)
+        else:
+            return feature_maps
+
+
+class CausalCNN(torch.nn.Module):
+    """
+    A network of repeated causal convolution blocks used to extract useful feature maps from 
+    multivariate time series data. 
+
+    Takes as input a three-dimensional tensor (`B`, `C`, `L`) where `B` is the
+    batch size, `C` is the number of input channels, and `L` is the length of
+    the input. Outputs a three-dimensional tensor (`B`, `C_out`, `L`).
+
+    This network appends causal blocks with exponentially increasing size of the dilations based on 
+    the prespecified depth of the network. This enables heirarchical integration of time-series-data
+    without the need for hidden states or other forms of recurrence. 
+
+    Attributes
+    ----------
+    network: Sequential
+        The torch.nn.Sequential object used to perform a forward pass through the network. This is the main
+        network architecture. 
+    
+    Methods
+    -------
+    forward(X)
+        Takes input rank 3 tensor X of dimension (B,C,L) where B is batch number, C is number of channels, 
+        and L is the length and returns tensor of dimension (B,C_out,L) which consists of C_out feature
+        maps generated from casual diluted convolution.
+    """
+
+    def __init__(self, in_channels, out_channels, inter_channels, depth,  kernel_size):
+        """Intialize a new CausalCNN class with the specified hyperparameters. 
+
+        Parameters
+        ----------
+        in_channels: int
+            The number of input channels in the initial time series. This usually corresponds to multivariate 
+            time recordings of different varaibles (say position, velocity, acceleration).
+        
+        out_channels: int
+            The number of final desired feature maps in the output.
+        
+        inter_channels: int
+            The number of intermediate channels utilized within the sequence of casually diluted block connections.
+
+        depth: int
+            The number of causal blocks to utilize
+
+        kernel_size: int
+            The size of the 1D kernel utilized in the convolutional blocks. 
+        """
+        super(CausalCNN, self).__init__()
+
+        layers = [] # Used to store the convolutional blocks
+        dilation_size = 1 # Initial dilation size. 
+
+        # Generate all of the causal blocks iteratively with increasing dilution size
+        for i in range(depth):
+            
+            in_channels_block = 0 # Stores the in_channels for the ith convolutional block
+
+            # If this is the first block, ensure that it has input number of channels equal to 
+            # in_channels
+            if i == 0:
+                in_channels_block = in_channels
+            else:
+                in_channels_block = inter_channels
+            
+            new_block = CausalConvolutionBlock(
+                in_channels=in_channels_block,
+                out_channels =inter_channels,
+                kernel_size=kernel_size,
+                dilation = dilation_size,
+                use_final_activation=False
+            )
+
+            layers.append(new_block)
+
+            # Double the dilation size by 2 to ensure exponentially weighted dilation for the next layer
+            dilation_size *= 2
+        
+        
+        # Append the last layer seperately in order to make sure the number of final channels matches 
+        # the desired number. 
+        layers.append(CausalConvolutionBlock(
+            in_channels = inter_channels,
+            out_channels = out_channels,
+            kernel_size = kernel_size,
+            dilation = dilation_size
+        ))
+
+        # Lastly generate a sequential object to store all of the layers. 
+        self.network = torch.nn.Sequential(*layers)
+
+    def forward(self,X):
+        """Given an input rank 3 tensor X of dimensions (B,C,L), return a convolved representation of the
+        tensor.
+
+        Parameters
+        ----------
+        X: tensor        
+            A rank 3 tensor of dimension (B,C,L) where B is batch size, C is the number of channels,
+            and L is the length of the sequences.
+
+        Returns
+        -------
+        feature_maps: tensor
+            A rank 3 tensor containing the output of the convolutional block network of dimension (B,C_out,L).
+        """
+
+        feature_maps = self.network(X)
+        return feature_maps
+
+
+class CausalCNNEncoder(torch.nn.Module):
+    """
+    Encoder of a time series using a causal CNN: the computed representation is
+    the output of a fully connected layer applied to the output of an adaptive
+    max pooling layer applied on top of the causal CNN, which reduces the
+    length of the time series to a fixed size.
+
+    Takes as input a three-dimensional tensor (`B`, `C`, `L`) where `B` is the
+    batch size, `C` is the number of input channels, and `L` is the length of
+    the input. Outputs a three-dimensional tensor (`B`, `C`).
+
+    Attributes
+    ----------
+    network: torch.nn.Sequential
+        The internal feed forward network of the encoder. 
+    
+    Methods
+    -------
+    forward(X)
+        Returns the representations of a time series X
+    """
+
+    def __init__(self, in_channels, inter_channels, depth, reduced_size,out_channels, kernel_size):
+        """Initialize a new Causal CNN class with the given hyperparameters
+
+        Parameters
+        ----------
+        in_channels: int
+            The number of input channels of the time series to be compressed. Note that this will be equal to the 
+            number of variables measured. 
+        
+        inter_channels: int
+            The number of internal channels to use within the causal blocks when computing the representation
+        
+        depth: int
+            The number of causal blocks to utilize when computing the time series. 
+        
+        reduced_size:
+            The number of desired output channels from the encoder portion of the network
+
+        out_channels:
+            The number of final output channels desired after the linear layer
+
+        kernel_size:
+            Size of 1D kernel to utilize in convolutional steps.
+        """
+        super(CausalCNNEncoder, self).__init__()
+
+        # Generate a causal CNN layer with the required hyperparams
+        causal_cnn = CausalCNN(
+            in_channels = in_channels,
+            out_channels= reduced_size,
+            inter_channels = inter_channels,
+            depth = depth, 
+            kernel_size = kernel_size
+        )
+
+        # Reduce the size utilizing max pooling and then squeeze the dimension
+        reduce_size = torch.nn.AdaptiveMaxPool1d(1)
+        squeeze = SqueezeChannels()  # Squeezes the third dimension (time)
+
+        # Lastly perform one linear transformation to get the number of desired output channels. 
+        linear = torch.nn.Linear(reduced_size, out_channels)
+
+        # Concatenate all operations into this network. 
+        self.network = torch.nn.Sequential(
+            causal_cnn, reduce_size, squeeze, linear
+        )
+
+    def forward(self, X):
+        """Given a multivariable time series, return a representation
+
+        Parameters
+        ----------
+        X: tensor
+            The multivariate time series input fed to the network. Must be rank 3 tensor. 
+
+        Returns
+        -------
+        representation: tensor
+            A rank 2 tensor of the computing time series representaiton
+        """
+
+        representation = self.network(X)
+        return representation
+
 
 
 
